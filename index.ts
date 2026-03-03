@@ -257,13 +257,68 @@ export default function (pi: ExtensionAPI) {
     type: "string",
   });
 
+  pi.registerFlag("subagent", {
+    description:
+      "Name of a subagent to invoke directly. Pass the task as the positional argument.",
+    type: "string",
+  });
+
+  pi.registerFlag("subagent-cwd", {
+    description:
+      "Working directory for subagent processes spawned within this session (used with --subagent).",
+    type: "string",
+  });
+
+  pi.registerFlag("list-subagents", {
+    description: "List all discovered subagents and exit.",
+    type: "boolean",
+  });
+
   const depthConfig = resolveDelegationDepthConfig(pi);
   const { currentDepth, maxDepth, canDelegate } = depthConfig;
 
   let discoveredAgents: AgentConfig[] = [];
+  // Set when --subagent <name> is used; drives CLI mode in before_agent_start.
+  let cliTargetAgent: AgentConfig | null = null;
 
   // Auto-discover agents on session start
   pi.on("session_start", async (_event, ctx) => {
+    // --list-subagents: print all discovered agents and exit immediately.
+    if (pi.getFlag("list-subagents")) {
+      const { agents } = discoverAgents(ctx.cwd, "both");
+      if (agents.length === 0) {
+        process.stdout.write("No subagents found.\n");
+      } else {
+        const lines = agents.map(
+          (a) =>
+            `${a.name.padEnd(16)} (${a.source.padEnd(7)}) ${a.description}`,
+        );
+        process.stdout.write(lines.join("\n") + "\n");
+      }
+      process.exit(0);
+    }
+
+    // --subagent <name>: validate agent early so errors surface before Pi
+    // starts a session; store for before_agent_start injection.
+    const subagentName = pi.getFlag("subagent") as string | undefined;
+    if (subagentName) {
+      const { agents } = discoverAgents(ctx.cwd, "both");
+      const agent = agents.find((a) => a.name === subagentName);
+      if (!agent) {
+        const available = agents.map((a) => a.name).join(", ") || "none";
+        process.stderr.write(
+          `[pi-subagent] Unknown agent "${subagentName}". Available: ${available}\n`,
+        );
+        process.exit(1);
+      }
+      cliTargetAgent = agent;
+      // Populate discoveredAgents so the subagent tool works within the
+      // session (depth 0 < maxDepth, so delegation is still allowed).
+      if (canDelegate) discoveredAgents = agents;
+      return;
+    }
+
+    // Normal mode: discover agents for the subagent tool.
     if (!canDelegate) return;
 
     const discovery = discoverAgents(ctx.cwd, "both");
@@ -280,10 +335,19 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  // Inject available agents into the system prompt
+  // Inject the agent's system prompt (CLI mode) or the available-agents list
+  // (normal mode) before the model starts.
   pi.on("before_agent_start", async (event) => {
-    if (!canDelegate) return;
-    if (discoveredAgents.length === 0) return;
+    if (cliTargetAgent) {
+      // CLI mode: inject only the named agent's system prompt; skip the list.
+      const extra = cliTargetAgent.systemPrompt.trim()
+        ? "\n\n" + cliTargetAgent.systemPrompt.trim()
+        : "";
+      return { systemPrompt: event.systemPrompt + extra };
+    }
+
+    // Normal mode: inject available agent list (existing behavior, unchanged).
+    if (!canDelegate || discoveredAgents.length === 0) return;
 
     const agentList = discoveredAgents
       .map((a) => `- **${a.name}**: ${a.description}`)
@@ -449,9 +513,17 @@ Use single mode for one task, parallel mode when tasks are independent and can r
         }
 
         // ── Parallel mode ──
+        // Resolve flag-level cwd override for child processes.
+        const flagCwd = pi.getFlag("subagent-cwd") as string | undefined;
+
         if (params.tasks && params.tasks.length > 0) {
+          // Apply flag cwd as fallback for each task that doesn't specify one.
+          const tasksWithCwd = params.tasks.map((t) => ({
+            ...t,
+            cwd: t.cwd ?? flagCwd,
+          }));
           return executeParallel(
-            params.tasks,
+            tasksWithCwd,
             delegationMode,
             forkSessionSnapshotJsonl,
             agents,
@@ -467,7 +539,7 @@ Use single mode for one task, parallel mode when tasks are independent and can r
           return executeSingle(
             params.agent,
             params.task,
-            params.cwd,
+            params.cwd ?? flagCwd,
             delegationMode,
             forkSessionSnapshotJsonl,
             agents,
